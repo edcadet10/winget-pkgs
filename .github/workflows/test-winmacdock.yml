@@ -1,36 +1,71 @@
-name: Check publisher setup
+name: Inspect WinGet install
 on:
   push:
     branches: [test-winmacdock-1.0.0]
 permissions:
   contents: read
 jobs:
-  setup:
+  install:
+    name: Install and uninstall (${{ matrix.arch }}, ${{ matrix.scope }})
     if: github.repository == 'edcadet10/winget-pkgs'
-    runs-on: windows-2025
-    timeout-minutes: 7
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            scope: user
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      TEST_ARCH: ${{ matrix.arch }}
+      TEST_SCOPE: ${{ matrix.scope }}
     steps:
-      - name: Run the publisher's x64 installer with its documented silent switch
+      - name: Get the manifest from this commit
         shell: pwsh
         run: |
-          $name = 'WinMac-Dock-1.0.0-x64-Setup.exe'
-          $path = Join-Path $env:RUNNER_TEMP $name
-          Invoke-WebRequest "https://github.com/Asteski/WinMac-Dock/releases/download/v1.0.0/$name" -OutFile $path
-          if ((Get-FileHash $path).Hash -ne 'C05BE39BF158198B2CBA09F9E7C7DCE753C1A6B4EB184680FD765007CE1A6839') { throw 'Installer digest changed' }
-          $proc = Start-Process -FilePath $path -ArgumentList '/S' -PassThru
-          if ($proc.WaitForExit(90000)) {
-            if ($proc.ExitCode) { throw "Publisher setup exited with code $($proc.ExitCode)" }
-            Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WinMacDock' | Format-List DisplayName, Publisher, DisplayVersion, UninstallString, QuietUninstallString
-            exit 0
+          $path = 'manifests/a/Asteski/WinMacDock/1.0.0'
+          $null = New-Item -ItemType Directory manifest
+          foreach ($suffix in '.yaml', '.installer.yaml', '.locale.en-US.yaml') {
+            $file = "Asteski.WinMacDock$suffix"
+            $url = "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:GITHUB_SHA/$path/$file"
+            Invoke-WebRequest $url -OutFile "manifest/$file"
           }
-          Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -eq $proc.Id -or $_.ParentProcessId -eq $proc.Id -or $_.Name -match 'WinMac' } | Format-List Name, ProcessId, ParentProcessId, CommandLine
+      - name: Prepare WinGet
+        shell: pwsh
+        run: |
+          $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($arch -ne $env:TEST_ARCH) { throw "Unexpected host architecture $arch" }
+          $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+          if (!$winget -or [version]((& winget.exe --version).Trim().TrimStart('v')) -lt [version]'1.28.0') {
+            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
+            Repair-WinGetPackageManager -Force -Latest
+          }
+          winget --version
+          winget settings --enable LocalManifestFiles
+          if ($LASTEXITCODE) { throw "Could not enable local manifests: $LASTEXITCODE" }
+          winget validate --manifest manifest
+          if ($LASTEXITCODE) { throw "Manifest failed validation: $LASTEXITCODE" }
+      - name: Inspect a silent install on a clean runner
+        shell: pwsh
+        run: |
+          $proc = Start-Process winget.exe -ArgumentList @('install','--manifest','manifest','--silent','--scope','user','--verbose-logs','--architecture','x64','--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -NoNewWindow -PassThru
+          if ($proc.WaitForExit(65000)) { exit $proc.ExitCode }
+          $paths = @("$env:LOCALAPPDATA\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir", "$env:LOCALAPPDATA\Microsoft\WinGet\DiagOutputDir")
+          foreach ($p in $paths) {
+            $log = Get-ChildItem $p -Filter 'WinGet-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($log) {
+              Get-Content $log.FullName -Tail 55 | Where-Object { $_ -match 'arg|execut|install|elevat|error|wait|launch|zone|scan|reputat' }
+            }
+          }
+          Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -eq $proc.Id -or $_.ParentProcessId -eq $proc.Id -or $_.Name -match 'WinMac|smart.?screen|consent.exe|^OpenWith|UserOOBE' } | Format-List Name, ProcessId, ParentProcessId, CommandLine
           Add-Type -AssemblyName UIAutomationClient
-          $auto = [Windows.Automation.AutomationElement]
-          $windows = $auto::RootElement.FindAll([Windows.Automation.TreeScope]::Children, [Windows.Automation.Condition]::TrueCondition)
+          $winRoot = [Windows.Automation.AutomationElement]::RootElement
+          $windows = $winRoot.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)
           foreach ($win in $windows) {
-            if ($win.Current.ProcessId -eq $proc.Id -or $win.Current.Name -match 'WinMac|Setup|Installer') {
-              Write-Host "Window: $($win.Current.Name)"
+            Write-Host "Window $($win.Current.ProcessId): $($win.Current.Name)"
+            if ($win.Current.Name -match 'WinMac|Setup|Installer|Windows protected|Open File|Security|SmartScreen|reputation|publisher') {
               $win.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition) | ForEach-Object { if ($_.Current.Name) { Write-Host $_.Current.Name } }
             }
           }
-          throw 'Publisher setup did not exit within 90 seconds'
+          throw 'WinGet install was still waiting after 65 seconds'
