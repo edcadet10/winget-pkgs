@@ -73,26 +73,37 @@ jobs:
           "DockApp=$app" >> $env:GITHUB_ENV
           "DockRegistry=$($apps[0].PSPath)" >> $env:GITHUB_ENV
           Write-Host "Verified $($apps[0].DisplayName) $($apps[0].DisplayVersion), $env:TEST_ARCH, $env:TEST_SCOPE."
-      - name: Start the dock and close it with its own exit command
+      - name: Launch the installed command and verify it handles --exit
+        timeout-minutes: 3
         shell: pwsh
         run: |
-          $job = Start-Job {
-            $p = Start-Process -FilePath $env:DockCommand -PassThru
-            if ($p.WaitForExit(12000)) { throw "Dock exited during startup ($($p.ExitCode))" }
-            $quit = Start-Process -FilePath $env:DockCommand -ArgumentList '--exit' -PassThru
-            if (!$quit.WaitForExit(20000) -or $quit.ExitCode -ne 0 -or !$p.WaitForExit(20000) -or $p.ExitCode -ne 0) { throw 'Dock did not respond cleanly to its exit command' }
+          $launch = Start-Job {
+            $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH
+            winmac-dock.exe | Out-Null
+            if ($LASTEXITCODE) { throw "Dock exit code $LASTEXITCODE" }
           }
-          $null = Wait-Job $job -Timeout 60
-          if ($job.State -ne 'Completed') {
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+          $pipe = "WinMac.Dock.$sid.$session"
+          function Test-DockReady {
+            $pipes = [IO.Directory]::GetFiles('\\.\pipe\')
+            return [bool]($pipes | Where-Object { $_.EndsWith("\$pipe", [StringComparison]::OrdinalIgnoreCase) })
+          }
+          $deadline = [DateTime]::UtcNow.AddSeconds(40)
+          while (!(Test-DockReady) -and $launch.State -eq 'Running' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 400 }
+          if (!(Test-DockReady)) {
             Get-Process | Where-Object { $_.ProcessName -match 'WinMac|SmartScreen' -or $_.MainWindowTitle } | Select-Object ProcessName,MainWindowTitle | Format-Table -AutoSize
-            Get-Content "$env:LOCALAPPDATA\WinMac\Dock\WinMac.Dock.log" -Tail 16 -ErrorAction SilentlyContinue
-            Add-Type -AssemblyName UIAutomationClient
-            $windows = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)
-            foreach ($win in $windows) { Write-Host "Window $($win.Current.ProcessId): $($win.Current.Name)" }
-            Receive-Job $job
-            throw "Dock launch check did not complete successfully ($($job.State))"
+            Get-Content "$env:LOCALAPPDATA\WinMac\Dock\WinMac.Dock.log" -Tail 12 -ErrorAction SilentlyContinue
+            Receive-Job $launch
+            throw 'The installed command did not start the dock command listener'
           }
-          Receive-Job $job
+          $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH
+          winmac-dock.exe --exit | Out-Null
+          if ($LASTEXITCODE) { throw "Exit command failed with code $LASTEXITCODE" }
+          $null = Wait-Job $launch -Timeout 30
+          Receive-Job $launch
+          if ($launch.State -ne 'Completed' -or (Test-DockReady)) { throw 'Dock did not shut down after --exit' }
+          Write-Host 'The installed command started the dock and shut it down cleanly.'
       - name: Uninstall through WinGet and verify removal
         if: always() && steps.install.outcome == 'success'
         shell: pwsh
