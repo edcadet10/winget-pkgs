@@ -5,11 +5,11 @@ PackageVersion: 1.0.0
 MinimumOSVersion: 10.0.22621.0
 InstallerType: zip
 NestedInstallerType: portable
+ArchiveBinariesDependOnPath: true
 NestedInstallerFiles:
 - RelativeFilePath: WinMac.Dock.exe
-  PortableCommandAlias: winmac-dock
 Commands:
-- winmac-dock
+- WinMac.Dock
 ReleaseDate: 2026-11-22
 Installers:
 - Architecture: x64
