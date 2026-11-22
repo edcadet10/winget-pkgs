@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.28.0.schema.json
+
+PackageIdentifier: Asteski.WinMacDock
+PackageVersion: 1.0.0
+MinimumOSVersion: 10.0.22621.0
+InstallerType: nullsoft
+ProductCode: WinMacDock
+ReleaseDate: 2026-11-22
+Installers:
+- Architecture: x64
+  Scope: user
+  InstallerUrl: https://github.com/Asteski/WinMac-Dock/releases/download/v1.0.0/WinMac-Dock-1.0.0-x64-Setup.exe
+  InstallerSha256: C05BE39BF158198B2CBA09F9E7C7DCE753C1A6B4EB184680FD765007CE1A6839
+- Architecture: x64
+  Scope: machine
+  InstallerUrl: https://github.com/Asteski/WinMac-Dock/releases/download/v1.0.0/WinMac-Dock-1.0.0-x64-Setup.exe
+  InstallerSha256: C05BE39BF158198B2CBA09F9E7C7DCE753C1A6B4EB184680FD765007CE1A6839
+  InstallerSwitches:
+    Custom: /Machine
+  ElevationRequirement: elevationRequired
+- Architecture: arm64
+  Scope: user
+  InstallerUrl: https://github.com/Asteski/WinMac-Dock/releases/download/v1.0.0/WinMac-Dock-1.0.0-arm64-Setup.exe
+  InstallerSha256: 75AD812DA752A3F0D02F49A777FC54D81BF2659F402232D9C000A3C249FBF5F0
+- Architecture: arm64
+  Scope: machine
+  InstallerUrl: https://github.com/Asteski/WinMac-Dock/releases/download/v1.0.0/WinMac-Dock-1.0.0-arm64-Setup.exe
+  InstallerSha256: 75AD812DA752A3F0D02F49A777FC54D81BF2659F402232D9C000A3C249FBF5F0
+  InstallerSwitches:
+    Custom: /Machine
+  ElevationRequirement: elevationRequired
+ManifestType: installer
+ManifestVersion: 1.28.0
