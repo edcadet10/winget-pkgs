@@ -59,7 +59,8 @@ jobs:
         shell: pwsh
         run: |
           $root = if ($env:TEST_SCOPE -eq 'user') { 'HKCU:' } else { 'HKLM:' }
-          $apps = @(Get-ItemProperty "$root\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object DisplayName -CEQ 'WinMac Dock')
+          $uninstall = 'Microsoft\Windows\CurrentVersion\Uninstall\*'
+          $apps = @(Get-ItemProperty "$root\SOFTWARE\$uninstall", "$root\SOFTWARE\WOW6432Node\$uninstall" -ErrorAction SilentlyContinue | Where-Object DisplayName -CEQ 'WinMac Dock' | Sort-Object PSPath -Unique)
           if ($apps.Count -ne 1 -or $apps[0].DisplayVersion -cne '1.0.0' -or $apps[0].Publisher -cne 'Asteski') { throw 'Unexpected Apps and Features registration' }
           $app = Join-Path $apps[0].InstallLocation 'WinMac.Dock.exe'
           $pe = [IO.File]::ReadAllBytes($app)
@@ -75,14 +76,23 @@ jobs:
       - name: Start the dock and close it with its own exit command
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath $env:DockCommand -PassThru
-          if ($p.WaitForExit(12000)) {
-            Get-Content "$env:LOCALAPPDATA\WinMac\Dock\WinMac.Dock.log" -Tail 12 -ErrorAction SilentlyContinue
-            Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-2)} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'WinMac.Dock' } | Select-Object -First 2 -ExpandProperty Message
-            throw "Dock exited during startup ($($p.ExitCode))"
+          $job = Start-Job {
+            $p = Start-Process -FilePath $env:DockCommand -PassThru
+            if ($p.WaitForExit(12000)) { throw "Dock exited during startup ($($p.ExitCode))" }
+            $quit = Start-Process -FilePath $env:DockCommand -ArgumentList '--exit' -PassThru
+            if (!$quit.WaitForExit(20000) -or $quit.ExitCode -ne 0 -or !$p.WaitForExit(20000) -or $p.ExitCode -ne 0) { throw 'Dock did not respond cleanly to its exit command' }
           }
-          $quit = Start-Process -FilePath $env:DockCommand -ArgumentList '--exit' -PassThru
-          if (!$quit.WaitForExit(20000) -or $quit.ExitCode -ne 0 -or !$p.WaitForExit(20000) -or $p.ExitCode -ne 0) { throw 'Dock did not respond cleanly to its exit command' }
+          $null = Wait-Job $job -Timeout 60
+          if ($job.State -ne 'Completed') {
+            Get-Process | Where-Object { $_.ProcessName -match 'WinMac|SmartScreen' -or $_.MainWindowTitle } | Select-Object ProcessName,MainWindowTitle | Format-Table -AutoSize
+            Get-Content "$env:LOCALAPPDATA\WinMac\Dock\WinMac.Dock.log" -Tail 16 -ErrorAction SilentlyContinue
+            Add-Type -AssemblyName UIAutomationClient
+            $windows = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)
+            foreach ($win in $windows) { Write-Host "Window $($win.Current.ProcessId): $($win.Current.Name)" }
+            Receive-Job $job
+            throw "Dock launch check did not complete successfully ($($job.State))"
+          }
+          Receive-Job $job
       - name: Uninstall through WinGet and verify removal
         if: always() && steps.install.outcome == 'success'
         shell: pwsh
