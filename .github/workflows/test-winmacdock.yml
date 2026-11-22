@@ -68,7 +68,8 @@ jobs:
           $expected = if ($env:TEST_ARCH -eq 'arm64') { 0xaa64 } else { 0x8664 }
           if ($machine -ne $expected) { throw "Incorrect installed CPU type $machine" }
           $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH
-          $cmd = (Get-Command winmac-dock.exe -CommandType Application -ErrorAction Stop).Source
+          $cmd = (Get-Command WinMac.Dock.exe -CommandType Application -ErrorAction Stop).Source
+          if ($cmd -ne $app -or !(Test-Path -LiteralPath (Join-Path (Split-Path $cmd) 'WinMac.Dock.dll'))) { throw 'Command cannot find its runtime files' }
           "DockCommand=$cmd" >> $env:GITHUB_ENV
           "DockApp=$app" >> $env:GITHUB_ENV
           "DockRegistry=$($apps[0].PSPath)" >> $env:GITHUB_ENV
@@ -79,7 +80,7 @@ jobs:
         run: |
           $launch = Start-Job {
             $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH
-            winmac-dock.exe | Out-Null
+            WinMac.Dock.exe | Out-Null
             if ($LASTEXITCODE) { throw "Dock exit code $LASTEXITCODE" }
           }
           $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -98,7 +99,7 @@ jobs:
             throw 'The installed command did not start the dock command listener'
           }
           $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH
-          winmac-dock.exe --exit | Out-Null
+          WinMac.Dock.exe --exit | Out-Null
           if ($LASTEXITCODE) { throw "Exit command failed with code $LASTEXITCODE" }
           $null = Wait-Job $launch -Timeout 30
           Receive-Job $launch
