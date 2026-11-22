@@ -1,4 +1,4 @@
-name: Inspect WinGet install
+name: Test WinMac Dock portable packages
 on:
   push:
     branches: [test-winmacdock-1.0.0]
@@ -11,12 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        arch: [x64, arm64]
+        scope: [user, machine]
         include:
           - arch: x64
-            scope: user
             runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 10
     env:
       TEST_ARCH: ${{ matrix.arch }}
       TEST_SCOPE: ${{ matrix.scope }}
@@ -46,26 +49,46 @@ jobs:
           if ($LASTEXITCODE) { throw "Could not enable local manifests: $LASTEXITCODE" }
           winget validate --manifest manifest
           if ($LASTEXITCODE) { throw "Manifest failed validation: $LASTEXITCODE" }
-      - name: Inspect a silent install on a clean runner
+      - name: Install through WinGet
+        id: install
         shell: pwsh
         run: |
-          $proc = Start-Process winget.exe -ArgumentList @('install','--manifest','manifest','--silent','--scope','user','--verbose-logs','--architecture','x64','--disable-interactivity','--accept-package-agreements','--accept-source-agreements') -NoNewWindow -PassThru
-          if ($proc.WaitForExit(65000)) { exit $proc.ExitCode }
-          $paths = @("$env:LOCALAPPDATA\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir", "$env:LOCALAPPDATA\Microsoft\WinGet\DiagOutputDir")
-          foreach ($p in $paths) {
-            $log = Get-ChildItem $p -Filter 'WinGet-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($log) {
-              Get-Content $log.FullName -Tail 55 | Where-Object { $_ -match 'arg|execut|install|elevat|error|wait|launch|zone|scan|reputat' }
-            }
+          winget install --manifest manifest --architecture $env:TEST_ARCH --scope $env:TEST_SCOPE --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+          exit $LASTEXITCODE
+      - name: Check registration, installed CPU type and command
+        shell: pwsh
+        run: |
+          $root = if ($env:TEST_SCOPE -eq 'user') { 'HKCU:' } else { 'HKLM:' }
+          $apps = @(Get-ItemProperty "$root\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object DisplayName -CEQ 'WinMac Dock')
+          if ($apps.Count -ne 1 -or $apps[0].DisplayVersion -cne '1.0.0' -or $apps[0].Publisher -cne 'Asteski') { throw 'Unexpected Apps and Features registration' }
+          $app = Join-Path $apps[0].InstallLocation 'WinMac.Dock.exe'
+          $pe = [IO.File]::ReadAllBytes($app)
+          $machine = [BitConverter]::ToUInt16($pe, [BitConverter]::ToInt32($pe, 0x3c) + 4)
+          $expected = if ($env:TEST_ARCH -eq 'arm64') { 0xaa64 } else { 0x8664 }
+          if ($machine -ne $expected) { throw "Incorrect installed CPU type $machine" }
+          $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH
+          $cmd = (Get-Command winmac-dock.exe -CommandType Application -ErrorAction Stop).Source
+          "DockCommand=$cmd" >> $env:GITHUB_ENV
+          "DockApp=$app" >> $env:GITHUB_ENV
+          "DockRegistry=$($apps[0].PSPath)" >> $env:GITHUB_ENV
+          Write-Host "Verified $($apps[0].DisplayName) $($apps[0].DisplayVersion), $env:TEST_ARCH, $env:TEST_SCOPE."
+      - name: Start the dock and close it with its own exit command
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath $env:DockCommand -PassThru
+          if ($p.WaitForExit(12000)) {
+            Get-Content "$env:LOCALAPPDATA\WinMac\Dock\WinMac.Dock.log" -Tail 12 -ErrorAction SilentlyContinue
+            Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-2)} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'WinMac.Dock' } | Select-Object -First 2 -ExpandProperty Message
+            throw "Dock exited during startup ($($p.ExitCode))"
           }
-          Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -eq $proc.Id -or $_.ParentProcessId -eq $proc.Id -or $_.Name -match 'WinMac|smart.?screen|consent.exe|^OpenWith|UserOOBE' } | Format-List Name, ProcessId, ParentProcessId, CommandLine
-          Add-Type -AssemblyName UIAutomationClient
-          $winRoot = [Windows.Automation.AutomationElement]::RootElement
-          $windows = $winRoot.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)
-          foreach ($win in $windows) {
-            Write-Host "Window $($win.Current.ProcessId): $($win.Current.Name)"
-            if ($win.Current.Name -match 'WinMac|Setup|Installer|Windows protected|Open File|Security|SmartScreen|reputation|publisher') {
-              $win.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition) | ForEach-Object { if ($_.Current.Name) { Write-Host $_.Current.Name } }
-            }
+          $quit = Start-Process -FilePath $env:DockCommand -ArgumentList '--exit' -PassThru
+          if (!$quit.WaitForExit(20000) -or $quit.ExitCode -ne 0 -or !$p.WaitForExit(20000) -or $p.ExitCode -ne 0) { throw 'Dock did not respond cleanly to its exit command' }
+      - name: Uninstall through WinGet and verify removal
+        if: always() && steps.install.outcome == 'success'
+        shell: pwsh
+        run: |
+          winget uninstall --manifest manifest --scope $env:TEST_SCOPE --silent --disable-interactivity --accept-source-agreements
+          if ($LASTEXITCODE) { throw "WinGet uninstall failed ($LASTEXITCODE)" }
+          foreach ($path in $env:DockRegistry, $env:DockApp, $env:DockCommand) {
+            if ($path -and (Test-Path -LiteralPath $path)) { throw "Uninstall left $path behind" }
           }
-          throw 'WinGet install was still waiting after 65 seconds'
