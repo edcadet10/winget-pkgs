@@ -1,94 +1,36 @@
-name: Test WinMac Dock
+name: Check publisher setup
 on:
   push:
     branches: [test-winmacdock-1.0.0]
 permissions:
   contents: read
 jobs:
-  install:
-    name: Install and uninstall (${{ matrix.arch }}, ${{ matrix.scope }})
+  setup:
     if: github.repository == 'edcadet10/winget-pkgs'
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, arm64]
-        scope: [user, machine]
-        include:
-          - arch: x64
-            runner: windows-2025
-          - arch: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
-    env:
-      TEST_ARCH: ${{ matrix.arch }}
-      TEST_SCOPE: ${{ matrix.scope }}
+    runs-on: windows-2025
+    timeout-minutes: 7
     steps:
-      - name: Get the manifest from this commit
+      - name: Run the publisher's x64 installer with its documented silent switch
         shell: pwsh
         run: |
-          $path = 'manifests/a/Asteski/WinMacDock/1.0.0'
-          $null = New-Item -ItemType Directory manifest
-          foreach ($suffix in '.yaml', '.installer.yaml', '.locale.en-US.yaml') {
-            $file = "Asteski.WinMacDock$suffix"
-            $url = "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:GITHUB_SHA/$path/$file"
-            Invoke-WebRequest $url -OutFile "manifest/$file"
+          $name = 'WinMac-Dock-1.0.0-x64-Setup.exe'
+          $path = Join-Path $env:RUNNER_TEMP $name
+          Invoke-WebRequest "https://github.com/Asteski/WinMac-Dock/releases/download/v1.0.0/$name" -OutFile $path
+          if ((Get-FileHash $path).Hash -ne 'C05BE39BF158198B2CBA09F9E7C7DCE753C1A6B4EB184680FD765007CE1A6839') { throw 'Installer digest changed' }
+          $proc = Start-Process -FilePath $path -ArgumentList '/S' -PassThru
+          if ($proc.WaitForExit(90000)) {
+            if ($proc.ExitCode) { throw "Publisher setup exited with code $($proc.ExitCode)" }
+            Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WinMacDock' | Format-List DisplayName, Publisher, DisplayVersion, UninstallString, QuietUninstallString
+            exit 0
           }
-      - name: Prepare WinGet
-        shell: pwsh
-        run: |
-          $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-          if ($arch -ne $env:TEST_ARCH) { throw "Unexpected host architecture $arch" }
-          $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-          if (!$winget -or [version]((& winget.exe --version).Trim().TrimStart('v')) -lt [version]'1.28.0') {
-            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
-            Repair-WinGetPackageManager -Force -Latest
+          Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -eq $proc.Id -or $_.ParentProcessId -eq $proc.Id -or $_.Name -match 'WinMac' } | Format-List Name, ProcessId, ParentProcessId, CommandLine
+          Add-Type -AssemblyName UIAutomationClient
+          $auto = [Windows.Automation.AutomationElement]
+          $windows = $auto::RootElement.FindAll([Windows.Automation.TreeScope]::Children, [Windows.Automation.Condition]::TrueCondition)
+          foreach ($win in $windows) {
+            if ($win.Current.ProcessId -eq $proc.Id -or $win.Current.Name -match 'WinMac|Setup|Installer') {
+              Write-Host "Window: $($win.Current.Name)"
+              $win.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition) | ForEach-Object { if ($_.Current.Name) { Write-Host $_.Current.Name } }
+            }
           }
-          winget --version
-          winget settings --enable LocalManifestFiles
-          if ($LASTEXITCODE) { throw "Could not enable local manifests: $LASTEXITCODE" }
-          winget validate --manifest manifest
-          if ($LASTEXITCODE) { throw "Manifest failed validation: $LASTEXITCODE" }
-      - name: Install silently
-        shell: pwsh
-        run: |
-          $packageRoot = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\WinMacDock'
-          if ((Test-Path "HKCU:\$packageRoot") -or (Test-Path "HKLM:\$packageRoot")) { throw 'Unexpected pre-existing installation' }
-          $argsList = @('install','--manifest','manifest','--architecture',$env:TEST_ARCH,'--scope',$env:TEST_SCOPE,'--silent','--disable-interactivity','--accept-package-agreements','--accept-source-agreements')
-          $proc = Start-Process winget.exe -ArgumentList $argsList -NoNewWindow -PassThru
-          if (!$proc.WaitForExit(240000)) {
-            Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'WinMac|^Uninstall\.exe$' } | Select-Object Name, CommandLine
-            throw 'WinGet silent install timed out after four minutes'
-          }
-          if ($proc.ExitCode) { throw "Install failed with exit code $($proc.ExitCode)" }
-      - name: Verify installed package
-        shell: pwsh
-        run: |
-          $root = if ($env:TEST_SCOPE -eq 'user') { 'HKCU:' } else { 'HKLM:' }
-          $arp = @(foreach ($subkey in 'SOFTWARE\Microsoft', 'SOFTWARE\WOW6432Node\Microsoft') {
-            Get-ItemProperty -LiteralPath "$root\$subkey\Windows\CurrentVersion\Uninstall\WinMacDock" -ErrorAction SilentlyContinue
-          })
-          $arp | Format-List DisplayName, DisplayVersion, Publisher, InstallLocation, UninstallString, QuietUninstallString
-          if ($arp.Count -ne 1 -or $arp[0].DisplayName -cne 'WinMac Dock' -or $arp[0].Publisher -cne 'Asteski' -or $arp[0].DisplayVersion -cne '1.0.0') {
-            throw 'Unexpected installed metadata'
-          }
-          $exe = Join-Path $arp[0].InstallLocation 'WinMac.Dock.exe'
-          $pe = [IO.File]::ReadAllBytes($exe)
-          $machine = [BitConverter]::ToUInt16($pe, [BitConverter]::ToInt32($pe, 0x3c) + 4)
-          $expected = if ($env:TEST_ARCH -eq 'arm64') { 0xaa64 } else { 0x8664 }
-          if ($machine -ne $expected) { throw 'Installed CPU type does not match the runner' }
-          "UninstallDir=$($arp[0].InstallLocation)" >> $env:GITHUB_ENV
-          "UninstallKey=$($arp[0].PSPath)" >> $env:GITHUB_ENV
-      - name: Test WinGet silent uninstall
-        shell: pwsh
-        run: |
-          $argsList = @('uninstall','--manifest','manifest','--scope',$env:TEST_SCOPE,'--silent','--disable-interactivity','--accept-source-agreements')
-          $proc = Start-Process winget.exe -ArgumentList $argsList -NoNewWindow -PassThru
-          if (!$proc.WaitForExit(120000)) {
-            Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^Uninstall\.exe$|^Au_.exe$' } | Select-Object Name, CommandLine
-            throw 'WinGet silent uninstall timed out after two minutes'
-          }
-          if ($proc.ExitCode) { throw "Uninstall failed with exit code $($proc.ExitCode)" }
-          $exe = Join-Path $env:UninstallDir 'WinMac.Dock.exe'
-          for ($i = 0; $i -lt 30 -and ((Test-Path $env:UninstallKey) -or (Test-Path $exe)); $i++) { Start-Sleep -Seconds 1 }
-          if ((Test-Path $env:UninstallKey) -or (Test-Path $exe)) { throw 'Uninstall left the application installed' }
+          throw 'Publisher setup did not exit within 90 seconds'
